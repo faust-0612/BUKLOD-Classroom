@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { buildClassroomRecord } from './classroom-create.js';
+import { buildFacultyGradebookCsv, facultyGradebookFilename } from './gradebook-export.js';
 
 /* BUKLOD Classroom Gemini UI backed by the single authoritative BUKLOD Supabase.
    This browser module uses only a publishable key and signed-in RLS-scoped requests.
@@ -266,9 +267,11 @@ async function fetchCurrent(id,tab){
   }else if(tab==='masterlist'){
     out.roster=isFaculty()?await call(db.rpc('buklod_classroom_roster_members_v2',{p_classroom_id:id})):[];
   }else if(tab==='rle'){
+    let hoursQuery=select('buklod_education_rle_hours','id,rotation_id,student_user_id,duty_date,time_in,time_out,credited_minutes,verification_status');
+    if(!isFaculty())hoursQuery=hoursQuery.eq('student_user_id',activeUser.id);
     [out.rotations,out.rleHours]=await Promise.all([
       call(select('buklod_education_rle_rotations','id,title,area_name,organization_name,required_hours,grading_weight,starts_at,ends_at').order('starts_at',{ascending:false}).limit(100)),
-      call(select('buklod_education_rle_hours','id,rotation_id,student_user_id,duty_date,time_in,time_out,credited_minutes,verification_status').order('duty_date',{ascending:false}).limit(500))
+      call(hoursQuery.order('duty_date',{ascending:false}).limit(500))
     ]);
     if(isFaculty())out.roster=await call(db.rpc('buklod_classroom_roster_members_v2',{p_classroom_id:id}));
   }else if(tab==='portfolio'){
@@ -455,12 +458,29 @@ window.openPerformanceEntry=()=>{
   };
 };
 window.renderTabGrades=c=>box(isFaculty()?'Official Faculty Gradebook':'My Released Grades',
-  (isFaculty()?button('+ Add graded performance','openPerformanceEntry')+'<div style="height:12px"></div>':'')+
+  (isFaculty()?button('+ Add graded performance','openPerformanceEntry')+' '+button('Export gradebook CSV','exportGradebookCSV')+'<div style="height:12px"></div>':'')+
   (isFaculty()?rows(current().grades,x=>card(x.official_name,
     'Status: '+(x.final_status||'Draft')+' · Transmuted: '+(x.transmuted_grade??'Not released')+
     ' · Remarks: '+(x.grade_remarks||'—'))):
   rows(current().grades,x=>card(x.title,'Score: '+(x.score??'—')+'/'+(x.points_possible??'—')+
     ' · Status: '+(x.status||'—')+' · '+(x.feedback||'')))));
+window.exportGradebookCSV=()=>{
+  if(!activeUser || !isFaculty() || app.activeSubtab!=='grades' || current().loadedTab!=='grades')
+    return show('Open your authorized Faculty Gradebook before exporting.');
+  const official=current().grades;
+  if(!Array.isArray(official) || !official.length)
+    return show('No official faculty gradebook rows are available to export.');
+  try{
+    const csv=buildFacultyGradebookCsv(official);
+    const fileName=facultyGradebookFilename(app.classrooms[app.activeClassId]?.className,app.activeClassId);
+    const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+    const anchor=document.createElement('a');
+    anchor.href=url;anchor.download=fileName;anchor.hidden=true;
+    document.body.appendChild(anchor);anchor.click();anchor.remove();
+    window.setTimeout(()=>URL.revokeObjectURL(url),1000);
+    show('CSV prepared from the authorized gradebook. Verify before official use; this does not release grades.');
+  }catch(error){show('Could not export gradebook: '+safeError(error));}
+};
 window.renderTabAttendance=c=>{
   const sessions=current().attendance||[];
   const active=sessions.find(s=>!s.closed_at);
@@ -597,26 +617,32 @@ window.renderTabSettings=c=>box('Classroom Settings',card(c.className,
 
 let writeBusy=false;
 async function writeOnce(task){
-  if(writeBusy)return;
+  if(writeBusy)return show('An official save is already in progress. Please avoid duplicate submissions.');
+  const initialUser=activeUser?.id,initialClass=app.activeClassId;
+  const initialMode=desiredMode,initialTab=app.activeSubtab;
+  if(!initialUser || !validClass(initialClass))return show('Sign in and open an authorized classroom before saving.');
+  const sameContext=()=>activeUser?.id===initialUser &&
+    app.activeClassId===initialClass && desiredMode===initialMode;
   writeBusy=true;
-  let result;
   try{
-    result=await task();
+    const result=await task();
     if(result?.ok===false)throw Error(result?.error||'Backend rejected the action.');
+    // Never refresh an unrelated classroom or newly switched role after a delayed write.
+    if(!sameContext())return;
+    const warning=result?.warning || (result?.gradebook_recorded===false?
+      'Score saved, but it was not added to the weighted gradebook.':'');
+    show(warning?'Saved with warning: '+warning:'Saved and confirmed by BUKLOD Supabase.');
+    try{
+      if(app.activeSubtab!==initialTab)return;
+      await fetchCurrent(initialClass,initialTab);
+      if(!sameContext() || app.activeSubtab!==initialTab)return;
+      window.closeSlideDrawer();
+      window.renderSubjectWorkspace();
+    }catch(err){
+      if(sameContext())show('Saved successfully, but refreshing failed: '+safeError(err));
+    }
   }catch(err){
-    show('Not saved: '+safeError(err));
-    writeBusy=false;
-    return;
-  }
-  const warning=result?.warning || (result?.gradebook_recorded===false?
-    'Score saved, but it was not added to the weighted gradebook.':'');
-  show(warning?'Saved with warning: '+warning:'Saved and confirmed by BUKLOD Supabase.');
-  try{
-    await fetchCurrent(app.activeClassId,app.activeSubtab);
-    window.closeSlideDrawer();
-    window.renderSubjectWorkspace();
-  }catch(err){
-    show('Saved successfully, but refreshing failed: '+safeError(err));
+    if(sameContext())show('Not saved: '+safeError(err));
   }finally{writeBusy=false;}
 }
 window.acknowledgeFormalNotice=noticeId=>{
@@ -718,7 +744,7 @@ const unsupported=['confirmCreateClassroom','runEightStepRosterWizard','confirmR
   'recordLiveRecitationScore','undoLastRecitationScore','autoGenerateSyllabusWeek','testIdempotentSubmission',
   'triggerQuickCheckPulse','syncQuizToGradebook','addMakeupDutyHours','toggleRleSkillCompetency',
   'saveJournalEntry','saveSpeedGraderScore','saveQuickAddItem','addAnnouncementComment',
-  'pushDirectlyToGitHub','openVercelDeployDrawer','openSpeedGraderDrawer','exportGradebookCSV',
+  'pushDirectlyToGitHub','openVercelDeployDrawer','openSpeedGraderDrawer',
   'advanceGradeLifecycle','changeGradingScheme','launchInteractiveQuizDrawer',
   'postClassChatMessage','sendCallAttentionAlert','submitInteractiveQuizAttempt','submitQuickAdd',
   'syncLiveAttendanceToClass','copyFullHtmlToClipboard','downloadFullHtmlFile'];
@@ -751,7 +777,7 @@ window.openAuditDrawer=()=>window.openSlideDrawer('LIVE SYSTEM STATUS','Authenti
 window.openQuickAddDrawer=type=>{if(type==='announcement'||!type)return window.openRealPost();show('Use the corresponding authorized class module to create this item.');};
 
 window.openClassSwitcherDrawer=()=>{
-  const items=Object.values(app.classrooms);
+  const items=visibleClasses();
   const html=items.length?items.map(c=>
     '<button type="button" class="surface-card" style="display:block;width:100%;text-align:left;margin-bottom:10px" '+
     'onclick="openSubjectClass(\''+c.id+'\',\'CLASS\',\'overview\')">'+
