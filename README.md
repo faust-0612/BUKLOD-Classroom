@@ -1,12 +1,28 @@
-# BUKLOD Classroom — Standalone Source
+# BUKLOD Classroom — Independent Web Source (DEV)
 
-This repository is the dedicated source target for **APP_ID=buklod-classroom**. Source recovery is performed on an isolated DEV branch; the default branch is not a production release.
+**APP_ID:** `buklod-classroom` · **STATUS:** DEV source recovery, **NOT RELEASED** from this repository.
 
-## Safety gates
-- Never deploy or publish BUKLOD Classroom using BUKLOD Main's Expo project, runtime, domain, or OTA channel.
-- Never commit .env files, service-role keys, credentials, student records, encrypted recovery archives, or production database exports.
-- Classroom academic operations use server-authoritative permissions and released-grade visibility.
-- Import verified existing Classroom source only after provenance and public-repository safety checks. Validate genuine student/faculty E2E before RC or production.
-- Expo project ownership/hosting and the architecture boundary registry must be verified before deployment.
+This dedicated repository hosts the cloud-editable **Classroom web candidate**, recovered from `faust-0612/BUKLOD-Rork` branch `dev/classroom-completion-20261110` at commit `595bf55105fd94d57f27d5c81355f7ed6714082e` (`classroom-web/`). Original source files are preserved at the repository root; see `docs/UPSTREAM_CLASSROOM_WEB_README.md`.
 
-**Status:** recovery initialization; source and release target verification ongoing.
+## Web scripts
+
+- `npm install`
+- `npm test`
+- `npm run build`
+
+Build variables: `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`. Supply via provider secrets/environment, never commit actual values. No service-role/secret credentials in browser.
+
+## Critical boundaries and gates
+
+- This is a **web candidate**; it is not a verified reconstruction of the original standalone Expo/Android source.
+- The prior Expo project UUID `14100ed1-7f25-4551-9627-09d280498241` is historical evidence only; current ownership/hosting identity remains unverified.
+- `BUKLOD-Rork` is BUKLOD Main. It is **not** an allowed deployment fallback for this standalone app.
+- Preserve the Gemini reference UI/design and tested controls. Preserve working Main-side compatibility until secure integration has verified parity.
+- Do not merge the old Main PR #518 into Main just to complete this source move.
+- True Faculty/Student academic writes, RLS, grade release, Quiz→gradebook, attendance, RLE, and Live media require real E2E proof.
+- Production is blocked until the app-boundaries registry is updated **after** repository/Expo/hosting identity verification, followed by DEV→RC→Production gates.
+- Public repository: no `.env`, service-role key, student PII, private academic data, encrypted archives, local recovery dumps, or production DB exports.
+
+## Provenance
+
+This source was migrated by cloud-side GitHub API file copies. Each imported upstream file's Git blob SHA should match the original. No AppDeploy builds/credits or production deploys are implied.
