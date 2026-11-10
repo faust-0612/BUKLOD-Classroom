@@ -202,7 +202,14 @@ async function fetchCurrent(id,tab){
     identity.role==='FACULTY' && identity.is_faculty===true && assigned.faculty===true;
   const out={context:identity};
   const select=(table,cols)=>db.from(table).select(cols).eq('classroom_id',id);
-  if(tab==='overview'||tab==='discussions'){
+  if(tab==='chat'){
+    const threads=await call(db.from('buklod_education_classroom_threads').select('id,name')
+      .eq('classroom_id',id).eq('thread_type','GENERAL').is('archived_at',null).limit(1));
+    out.thread=threads?.[0]||null;
+    out.messages=out.thread?await call(db.from('buklod_education_classroom_messages')
+      .select('id,sender_user_id,body,created_at').eq('thread_id',out.thread.id)
+      .is('deleted_at',null).order('created_at',{ascending:true}).limit(100)):[];
+  }else if(tab==='overview'||tab==='discussions'){
     out.posts=await call(select('buklod_education_classroom_posts','id,title,body,is_pinned,is_locked,created_at,author_user_id').is('deleted_at',null).order('created_at',{ascending:false}).limit(70));
     const ids=out.posts.map(p=>p.id).filter(isoId);
     out.comments=ids.length?await call(select('buklod_education_classroom_comments','id,post_id,body,author_user_id,created_at')
@@ -275,6 +282,7 @@ async function fetchCurrent(id,tab){
   })):[];
   const liveSessions=(out.live||[]).filter(s=>['LIVE','ACTIVE','STARTED','IN_PROGRESS'].includes(String(s.status).toUpperCase()));
   if(liveSessions.length)app.liveSession={active:true,mode:'LIVE',connectedCount:0,maxTarget:0,activeCameras:0};
+  if(tab==='chat')window.bindClassMessageForm();
 }
 const originalOpen=window.openSubjectClass;
 window.openSubjectClass=async(id,group='CLASS',tab='overview')=>{
@@ -307,6 +315,34 @@ window.renderTabOverview=c=>box('Class Announcements & Stream',
       '<p class="muted" style="font-size:12px;margin:5px 0 9px">'+esc(count+' comment'+(count===1?'':'s'))+'</p>'+
       button('Read / Comment','openRealComment',JSON.stringify(p.id));
   }));
+window.renderTabChat=c=>{
+  const thread=current().thread,messages=current().messages||[];
+  const canSend=isFaculty()||current().context?.allow_student_chat===true;
+  const messageHtml=messages.length?messages.map(m=>
+    '<div class="message '+(m.sender_user_id===activeUser.id?'mine':'')+'">'+
+    '<small>'+(m.sender_user_id===activeUser.id?'You':'Class member')+' · '+esc(fmt(m.created_at))+'</small>'+
+    '<p>'+esc(m.body)+'</p></div>').join(''):empty('No messages in the general class channel yet.');
+  return box('Class Messages',thread?
+    '<p style="font-size:12px;color:#64748b;margin-bottom:10px">'+esc(thread.name||'General class channel')+'</p>'+
+    '<div class="messages">'+messageHtml+'</div>'+
+    (canSend?'<form id="classMessageForm" style="margin-top:12px"><label class="field">Message<textarea class="form-textarea" name="body" rows="3" maxlength="4000" required placeholder="Send a message to your class"></textarea></label><button type="submit" class="btn-primary-cyan">Send message</button></form>':
+      empty('Messaging is disabled for this student in this classroom.')):
+    empty('The general class channel has not been initialized.'));
+};
+window.bindClassMessageForm=()=>{
+  const form=el('classMessageForm');if(!form)return;
+  form.onsubmit=e=>{
+    e.preventDefault();
+    if(!(isFaculty()||current().context?.allow_student_chat===true))return show('Messaging is disabled for this role.');
+    const text=String(new FormData(form).get('body')||'').trim();
+    if(!text||text.length>4000)return show('Enter a message up to 4,000 characters.');
+    const thread=current().thread;
+    if(!thread?.id)return show('The general class channel is unavailable.');
+    void writeOnce(()=>call(db.from('buklod_education_classroom_messages').insert({
+      classroom_id:app.activeClassId,thread_id:thread.id,sender_user_id:activeUser.id,body:text
+    })));
+  };
+};
 window.renderTabDiscussions=c=>window.renderTabOverview(c);
 window.renderTabSyllabus=c=>box('Syllabus & Weeks',rows(current().modules,m=>card('Week '+(m.module_no||'—')+' · '+m.title,m.description)))+
   box('Official Class Materials',rows(current().materials,m=>card(m.title,m.description||'Released learning material')));
