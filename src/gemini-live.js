@@ -5,9 +5,11 @@ import { buildClassroomRecord } from './classroom-create.js';
    This browser module uses only a publishable key and signed-in RLS-scoped requests.
    It deliberately refuses simulation of grades, rosters, attendance, live presence,
    role impersonation, offline sync, deletion, and completion status. */
-const db = createClient('https://yhanxndaqbmuzbdqlblu.supabase.co', "sb_publishable_RWvrYHzgLMvBousgwn4dTg_QawYzwRS", {
-  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-});
+const supabaseUrl=import.meta.env.VITE_SUPABASE_URL||'';
+const supabasePublishableKey=import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY||'';
+const db=supabaseUrl&&supabasePublishableKey?createClient(supabaseUrl,supabasePublishableKey,{
+  auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}
+}):null;
 // Never accept or retain legacy credential-bearing handoff query parameters.
 const incoming = new URLSearchParams(location.search);
 if (incoming.has('access_token') || incoming.has('refresh_token') || incoming.has('buklod_handoff')) {
@@ -810,7 +812,7 @@ window.handleSignOutClick=async()=>{
 };
 // Respond immediately to sign-out from another tab/device to avoid showing stale
 // cached academic data from a revoked local session.
-db.auth.onAuthStateChange(event=>{
+if(db)db.auth.onAuthStateChange(event=>{
   if(event==='SIGNED_OUT')clearPrivateSession();
 });
 
@@ -844,8 +846,13 @@ async function consumeMainDoorHandoff(){
 }
 function displayAuth(errorText=''){
   el('liveAuthScreen')?.remove();
-  const node=document.createElement('section');node.id='liveAuthScreen';node.innerHTML=
-    '<div class="auth-wrap"><div style="font-size:34px;margin-bottom:10px">▦</div><h1>BUKLOD Classroom</h1>' +
+  const node=document.createElement('section');node.id='liveAuthScreen';
+  if(!db){
+    node.innerHTML='<div class="auth-wrap" role="alert"><h1>BUKLOD Classroom</h1>'+
+      '<p>Secure Classroom service configuration is missing. Ask your administrator to configure the authorized Supabase URL and publishable key.</p></div>';
+    document.body.appendChild(node);return;
+  }
+  node.innerHTML='<div class="auth-wrap"><div style="font-size:34px;margin-bottom:10px">▦</div><h1>BUKLOD Classroom</h1>' +
     '<p>Sign in with your BUKLOD account to access your assigned classrooms and official academic records.</p>'+
     '<form id="liveLogin"><label>Email<input name="email" type="email" required autocomplete="username" placeholder="Your BUKLOD email"></label>'+
     '<label>Password<input name="password" type="password" required autocomplete="current-password" placeholder="Password"></label>'+
@@ -892,11 +899,14 @@ for(const selector of ['button[onclick="openVercelDeployDrawer()"]','button[oncl
 }
 window.addEventListener('offline',()=>{const x=el('networkLabel');if(x)x.textContent='Offline · Read only';});
 window.addEventListener('online',()=>{const x=el('networkLabel');if(x)x.textContent='Online · BUKLOD';});
-if(ssoHandoff)displayHandoffProgress();else displayAuth();
-try{
-  if(ssoHandoff)await consumeMainDoorHandoff();
-  await hydrate();
-}catch(err){
-  displayAuth(ssoHandoff ? safeError(err) :
-    'Could not load your assigned classrooms: '+safeError(err));
+if(!db)displayAuth();
+else{
+  if(ssoHandoff)displayHandoffProgress();else displayAuth();
+  try{
+    if(ssoHandoff)await consumeMainDoorHandoff();
+    await hydrate();
+  }catch(err){
+    displayAuth(ssoHandoff ? safeError(err) :
+      'Could not load your assigned classrooms: '+safeError(err));
+  }
 }
