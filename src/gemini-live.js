@@ -284,7 +284,6 @@ async function fetchCurrent(id,tab){
   })):[];
   const liveSessions=(out.live||[]).filter(s=>['LIVE','ACTIVE','STARTED','IN_PROGRESS'].includes(String(s.status).toUpperCase()));
   if(liveSessions.length)app.liveSession={active:true,mode:'LIVE',connectedCount:0,maxTarget:0,activeCameras:0};
-  if(tab==='chat')window.bindClassMessageForm();
 }
 const originalOpen=window.openSubjectClass;
 window.openSubjectClass=async(id,group='CLASS',tab='overview')=>{
@@ -292,6 +291,7 @@ window.openSubjectClass=async(id,group='CLASS',tab='overview')=>{
     show('Classroom access denied for this active role.');return;
   }
   try{app.activeClassId=id;app.activeGroup=group;app.activeSubtab=tab;await fetchCurrent(id,tab);originalOpen(id,group,tab);
+    window.bindClassMessageForm();
     history.replaceState({},'',location.pathname+'?class='+encodeURIComponent(id)+'&group='+encodeURIComponent(group)+'&tab='+encodeURIComponent(tab));
   }catch(error){show('Could not open authorized Classroom: '+safeError(error));window.showPortalHome();}
 };
@@ -300,12 +300,14 @@ window.switchWorkspaceGroup=async(group,tab)=>{
   if(!['CLASS','WORK','CONNECT','MORE'].includes(group))return;
   const key=tab||window.SUBTABS_BY_GROUP[group][0].id;
   app.activeGroup=group;app.activeSubtab=key;
-  try{await fetchCurrent(app.activeClassId,key);originalGroup(group,key);}
+  try{await fetchCurrent(app.activeClassId,key);originalGroup(group,key);
+    window.bindClassMessageForm();}
   catch(err){el('workspaceBodyContent').innerHTML=box('Could not load',empty(safeError(err)));}
 };
 const originalSubtab=window.switchWorkspaceSubtab;
 window.switchWorkspaceSubtab=async key=>{
-  try{await fetchCurrent(app.activeClassId,key);originalSubtab(key);}
+  try{await fetchCurrent(app.activeClassId,key);originalSubtab(key);
+    window.bindClassMessageForm();}
   catch(err){el('workspaceBodyContent').innerHTML=box('Could not load',empty(safeError(err)));}
 };
 const rows=(items,make)=>items?.length?items.map(make).join(''):empty('No authorized records found.');
