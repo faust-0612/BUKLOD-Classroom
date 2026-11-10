@@ -1,12 +1,16 @@
 import { createClient } from '@supabase/supabase-js';
+import { buildClassroomRecord } from './classroom-create.js';
+import { buildFacultyGradebookCsv, facultyGradebookFilename } from './gradebook-export.js';
 
 /* BUKLOD Classroom Gemini UI backed by the single authoritative BUKLOD Supabase.
    This browser module uses only a publishable key and signed-in RLS-scoped requests.
    It deliberately refuses simulation of grades, rosters, attendance, live presence,
    role impersonation, offline sync, deletion, and completion status. */
-const db = createClient('https://yhanxndaqbmuzbdqlblu.supabase.co', "sb_publishable_RWvrYHzgLMvBousgwn4dTg_QawYzwRS", {
-  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-});
+const supabaseUrl=import.meta.env.VITE_SUPABASE_URL||'';
+const supabasePublishableKey=import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY||'';
+const db=supabaseUrl&&supabasePublishableKey?createClient(supabaseUrl,supabasePublishableKey,{
+  auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}
+}):null;
 // Never accept or retain legacy credential-bearing handoff query parameters.
 const incoming = new URLSearchParams(location.search);
 if (incoming.has('access_token') || incoming.has('refresh_token') || incoming.has('buklod_handoff')) {
@@ -163,7 +167,9 @@ async function refreshClasses(){
   const flags=[...roleByClass.values()];
   const hasFaculty=flags.some(x=>x.faculty), hasStudent=flags.some(x=>x.student);
   if(!desiredMode)desiredMode=hasFaculty?'FACULTY':hasStudent?'STUDENT':null;
-  if(desiredMode==='FACULTY'&&!hasFaculty || desiredMode==='STUDENT'&&!hasStudent)
+  let facultyAccess=false;
+  try{const gate=await call(db.rpc('buklod_classroom_launcher_access_v1'));facultyAccess=gate?.is_faculty===true;}catch{}
+  if((desiredMode==='FACULTY'&&!hasFaculty&&merged.size>0) || (desiredMode==='STUDENT'&&!hasStudent))
     throw Error('The requested Classroom role is not assigned to this BUKLOD account.');
   app.activeClassId=visibleClasses()[0]?.id||'';
   window.injectAllCanonicalLogos();
@@ -171,7 +177,7 @@ async function refreshClasses(){
   void fetchLiveOverview();
   el('portalSubRoleText').textContent='ONE IDENTITY • OFFICIAL BUKLOD RECORDS';
   const oldEmail=el('activeEmailLabel');if(oldEmail)oldEmail.textContent=activeUser.email||'Signed in';
-  const create=el('createClassPortalBtn');if(create)create.style.display='none';
+  const create=el('createClassPortalBtn');if(create)create.style.display=facultyAccess?'':'none';
   const role=el('rolePersonaSelect');
   if(role){
     const options=[];
@@ -199,7 +205,14 @@ async function fetchCurrent(id,tab){
     identity.role==='FACULTY' && identity.is_faculty===true && assigned.faculty===true;
   const out={context:identity};
   const select=(table,cols)=>db.from(table).select(cols).eq('classroom_id',id);
-  if(tab==='overview'||tab==='discussions'){
+  if(tab==='chat'){
+    const threads=await call(db.from('buklod_education_classroom_threads').select('id,name')
+      .eq('classroom_id',id).eq('thread_type','GENERAL').is('archived_at',null).limit(1));
+    out.thread=threads?.[0]||null;
+    out.messages=out.thread?await call(db.from('buklod_education_classroom_messages')
+      .select('id,sender_user_id,body,created_at').eq('thread_id',out.thread.id)
+      .is('deleted_at',null).order('created_at',{ascending:true}).limit(100)):[];
+  }else if(tab==='overview'||tab==='discussions'){
     out.posts=await call(select('buklod_education_classroom_posts','id,title,body,is_pinned,is_locked,created_at,author_user_id').is('deleted_at',null).order('created_at',{ascending:false}).limit(70));
     const ids=out.posts.map(p=>p.id).filter(isoId);
     out.comments=ids.length?await call(select('buklod_education_classroom_comments','id,post_id,body,author_user_id,created_at')
@@ -210,11 +223,15 @@ async function fetchCurrent(id,tab){
       call(select('buklod_education_materials','id,title,description,is_released,created_at').order('created_at',{ascending:false}).limit(100))]);
     out.modules=a;out.materials=isFaculty()?b:b.filter(m=>m.is_released);
   }else if(tab==='activities'){
-    const [a,b]=await Promise.all([
+    const tasks=[
       call(select('buklod_education_classroom_assignments','id,title,description,instructions,points_possible,due_at,status').order('created_at',{ascending:false}).limit(100)),
-      call(select('buklod_education_classroom_submissions','id,assignment_id,student_user_id,attempt_no,status,score,faculty_feedback,submitted_at').order('submitted_at',{ascending:false}).limit(300))]);
+      call(select('buklod_education_classroom_submissions','id,assignment_id,student_user_id,attempt_no,status,score,faculty_feedback,submitted_at').order('submitted_at',{ascending:false}).limit(300))
+    ];
+    if(isFaculty())tasks.push(call(select('buklod_education_grade_categories','id,name,term_key').order('name',{ascending:true}).limit(100)));
+    const [a,b,categories]=await Promise.all(tasks);
     out.assignments=isFaculty()?a:a.filter(x=>x.status==='PUBLISHED');
     out.submissions=isFaculty()?b:b.filter(x=>x.student_user_id===activeUser.id);
+    if(isFaculty())out.gradeCategories=categories;
   }else if(tab==='quiz'){
     out.assessments=await call(select('buklod_education_assessments','id,title,assessment_type,status,opens_at,points_possible').order('created_at',{ascending:false}).limit(80));
     if(!isFaculty())out.assessments=out.assessments.filter(x=>x.status==='PUBLISHED');
@@ -233,17 +250,41 @@ async function fetchCurrent(id,tab){
         .eq('user_id',activeUser.id)):[];
   }else if(tab==='grades'){
     out.grades=await call(db.rpc(isFaculty()?'buklod_classroom_gradebook_roster_v1':'buklod_classroom_student_released_grade_items_v2',{p_classroom_id:id}));
+    if(isFaculty()){
+      [out.roster,out.gradeCategories]=await Promise.all([
+        call(db.rpc('buklod_classroom_roster_members_v2',{p_classroom_id:id})),
+        call(select('buklod_education_grade_categories','id,name,term_key,weight_percent').order('name',{ascending:true}).limit(100))
+      ]);
+    }
   }else if(tab==='attendance'){
     out.attendance=await call(select('buklod_education_attendance_sessions','id,opened_at,closed_at,term_key').order('opened_at',{ascending:false}).limit(60));
-    if(!isFaculty())out.studentAttendance=await call(db.rpc('buklod_classroom_student_attendance_v1',{p_classroom_id:id}));
+    if(isFaculty()){
+      out.roster=await call(db.rpc('buklod_classroom_roster_members_v2',{p_classroom_id:id}));
+      const open=out.attendance.find(s=>!s.closed_at);
+      out.attendanceLog=open?await call(db.from('buklod_education_attendance_log')
+        .select('roster_member_id,status,time_in').eq('session_id',open.id).limit(500)):[];
+    }else out.studentAttendance=await call(db.rpc('buklod_classroom_student_attendance_v1',{p_classroom_id:id}));
   }else if(tab==='masterlist'){
     out.roster=isFaculty()?await call(db.rpc('buklod_classroom_roster_members_v2',{p_classroom_id:id})):[];
-  }else if(tab==='rle'||tab==='portfolio'){
+  }else if(tab==='rle'){
+    let hoursQuery=select('buklod_education_rle_hours','id,rotation_id,student_user_id,duty_date,time_in,time_out,credited_minutes,verification_status');
+    if(!isFaculty())hoursQuery=hoursQuery.eq('student_user_id',activeUser.id);
+    [out.rotations,out.rleHours]=await Promise.all([
+      call(select('buklod_education_rle_rotations','id,title,area_name,organization_name,required_hours,grading_weight,starts_at,ends_at').order('starts_at',{ascending:false}).limit(100)),
+      call(hoursQuery.order('duty_date',{ascending:false}).limit(500))
+    ]);
+    if(isFaculty())out.roster=await call(db.rpc('buklod_classroom_roster_members_v2',{p_classroom_id:id}));
+  }else if(tab==='portfolio'){
     out.health=await call(db.rpc('buklod_classroom_overview_v1',{p_classroom_id:id}));
   }
   if(request!==activeRequest)return;
   cache.set(id,{...cache.get(id),...out,loadedTab:tab});
-  c.roster=isFaculty()?(out.roster||cache.get(id)?.roster||[]):[];
+  const roster=out.roster||cache.get(id)?.roster||[];
+  const logs=out.attendanceLog||cache.get(id)?.attendanceLog||[];
+  c.roster=isFaculty()?roster.map(r=>({
+    ...r,id:r.roster_member_id,name:r.official_name,studentId:r.official_student_no||'',
+    attendance:logs.find(x=>x.roster_member_id===r.roster_member_id)?.status||'—'
+  })):[];
   const liveSessions=(out.live||[]).filter(s=>['LIVE','ACTIVE','STARTED','IN_PROGRESS'].includes(String(s.status).toUpperCase()));
   if(liveSessions.length)app.liveSession={active:true,mode:'LIVE',connectedCount:0,maxTarget:0,activeCameras:0};
 }
@@ -253,6 +294,7 @@ window.openSubjectClass=async(id,group='CLASS',tab='overview')=>{
     show('Classroom access denied for this active role.');return;
   }
   try{app.activeClassId=id;app.activeGroup=group;app.activeSubtab=tab;await fetchCurrent(id,tab);originalOpen(id,group,tab);
+    window.bindClassMessageForm();
     history.replaceState({},'',location.pathname+'?class='+encodeURIComponent(id)+'&group='+encodeURIComponent(group)+'&tab='+encodeURIComponent(tab));
   }catch(error){show('Could not open authorized Classroom: '+safeError(error));window.showPortalHome();}
 };
@@ -261,12 +303,14 @@ window.switchWorkspaceGroup=async(group,tab)=>{
   if(!['CLASS','WORK','CONNECT','MORE'].includes(group))return;
   const key=tab||window.SUBTABS_BY_GROUP[group][0].id;
   app.activeGroup=group;app.activeSubtab=key;
-  try{await fetchCurrent(app.activeClassId,key);originalGroup(group,key);}
+  try{await fetchCurrent(app.activeClassId,key);originalGroup(group,key);
+    window.bindClassMessageForm();}
   catch(err){el('workspaceBodyContent').innerHTML=box('Could not load',empty(safeError(err)));}
 };
 const originalSubtab=window.switchWorkspaceSubtab;
 window.switchWorkspaceSubtab=async key=>{
-  try{await fetchCurrent(app.activeClassId,key);originalSubtab(key);}
+  try{await fetchCurrent(app.activeClassId,key);originalSubtab(key);
+    window.bindClassMessageForm();}
   catch(err){el('workspaceBodyContent').innerHTML=box('Could not load',empty(safeError(err)));}
 };
 const rows=(items,make)=>items?.length?items.map(make).join(''):empty('No authorized records found.');
@@ -278,15 +322,76 @@ window.renderTabOverview=c=>box('Class Announcements & Stream',
       '<p class="muted" style="font-size:12px;margin:5px 0 9px">'+esc(count+' comment'+(count===1?'':'s'))+'</p>'+
       button('Read / Comment','openRealComment',JSON.stringify(p.id));
   }));
+window.renderTabChat=c=>{
+  const thread=current().thread,messages=current().messages||[];
+  const canSend=isFaculty()||current().context?.allow_student_chat===true;
+  const messageHtml=messages.length?messages.map(m=>
+    '<div class="message '+(m.sender_user_id===activeUser.id?'mine':'')+'">'+
+    '<small>'+(m.sender_user_id===activeUser.id?'You':'Class member')+' · '+esc(fmt(m.created_at))+'</small>'+
+    '<p>'+esc(m.body)+'</p></div>').join(''):empty('No messages in the general class channel yet.');
+  return box('Class Messages',thread?
+    '<p style="font-size:12px;color:#64748b;margin-bottom:10px">'+esc(thread.name||'General class channel')+'</p>'+
+    '<div class="messages">'+messageHtml+'</div>'+
+    (canSend?'<form id="classMessageForm" style="margin-top:12px"><label class="field">Message<textarea class="form-textarea" name="body" rows="3" maxlength="4000" required placeholder="Send a message to your class"></textarea></label><button type="submit" class="btn-primary-cyan">Send message</button></form>':
+      empty('Messaging is disabled for this student in this classroom.')):
+    empty('The general class channel has not been initialized.'));
+};
+window.bindClassMessageForm=()=>{
+  const form=el('classMessageForm');if(!form)return;
+  form.onsubmit=e=>{
+    e.preventDefault();
+    if(!(isFaculty()||current().context?.allow_student_chat===true))return show('Messaging is disabled for this role.');
+    const text=String(new FormData(form).get('body')||'').trim();
+    if(!text||text.length>4000)return show('Enter a message up to 4,000 characters.');
+    const thread=current().thread;
+    if(!thread?.id)return show('The general class channel is unavailable.');
+    void writeOnce(()=>call(db.from('buklod_education_classroom_messages').insert({
+      classroom_id:app.activeClassId,thread_id:thread.id,sender_user_id:activeUser.id,body:text
+    })));
+  };
+};
 window.renderTabDiscussions=c=>window.renderTabOverview(c);
 window.renderTabSyllabus=c=>box('Syllabus & Weeks',rows(current().modules,m=>card('Week '+(m.module_no||'—')+' · '+m.title,m.description)))+
   box('Official Class Materials',rows(current().materials,m=>card(m.title,m.description||'Released learning material')));
-window.renderTabActivities=c=>box('Activities & Submissions',rows(current().assignments,a=>card(a.title,
-  (a.instructions||a.description||'')+' · Due: '+fmt(a.due_at)+' · '+a.points_possible+' pts')+
-  (!isFaculty()?button('Submit Answer','openRealSubmit',JSON.stringify(a.id)):'')+
-  (isFaculty()?current().submissions.filter(x=>x.assignment_id===a.id).map(x=>
-    card('Student submission · '+x.status,'Submitted '+fmt(x.submitted_at)+ ' · '+(x.score??'Not graded'))+
-    button('Grade Submission','openRealGrade',JSON.stringify(x.id))).join(''):'')));
+window.openAssignmentDrawer=()=>{
+  if(!isFaculty())return show('Faculty assignment permission required.');
+  const categories=current().gradeCategories||[];
+  if(!categories.length)return show('Configure an official grade category before creating an assignment.');
+  window.openSlideDrawer('CLASS ACTIVITIES','Create assignment',
+    '<form id="assignmentCreateForm">'+
+    '<label class="field">Title<input name="title" class="form-input" maxlength="200" required></label>'+
+    '<label class="field">Description<textarea name="description" class="form-textarea" maxlength="4000"></textarea></label>'+
+    '<label class="field">Instructions<textarea name="instructions" class="form-textarea" maxlength="10000" required></textarea></label>'+
+    '<label class="field">Grade category<select name="category" class="form-select" required>'+
+      categories.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+' · '+esc(c.term_key||'Term')+'</option>').join('')+'</select></label>'+
+    '<label class="field">Points possible<input name="points" class="form-input" type="number" min="0.01" max="10000" step="0.01" required></label>'+
+    '<label class="field">Due date<input name="due" class="form-input" type="datetime-local"></label>'+
+    '<label><input name="publish" type="checkbox"> Publish to enrolled students immediately</label>'+
+    '<p class="field-hint">Student visibility and submission access are enforced by Classroom RLS. This activity accepts text and secure links.</p>'+
+    '<button type="submit" class="btn-primary-cyan">Save assignment</button></form>');
+  el('assignmentCreateForm').onsubmit=e=>{
+    e.preventDefault();const f=new FormData(e.target),title=String(f.get('title')||'').trim();
+    const instructions=String(f.get('instructions')||'').trim(),points=Number(f.get('points'));
+    if(!title||!instructions||!Number.isFinite(points)||points<=0||points>10000)return show('Enter valid assignment details and points.');
+    const due=f.get('due')?new Date(String(f.get('due'))).toISOString():null;
+    const payload={
+      classroom_id:app.activeClassId,title,description:String(f.get('description')||'').trim()||null,
+      instructions,points_possible:points,grade_category_id:String(f.get('category')),
+      submission_types:['TEXT','LINK'],auto_grading_mode:'NONE',auto_grade_requires_review:true,
+      status:f.get('publish')==='on'?'PUBLISHED':'DRAFT',created_by:activeUser.id
+    };
+    if(due)payload.due_at=due;
+    void writeOnce(()=>call(db.from('buklod_education_classroom_assignments').insert(payload)));
+  };
+};
+window.renderTabActivities=c=>box('Activities & Submissions',
+  (isFaculty()?button('+ Create assignment','openAssignmentDrawer')+'<div style="height:12px"></div>':'')+
+  rows(current().assignments,a=>card(a.title,
+    (a.instructions||a.description||'')+' · '+a.status+' · Due: '+fmt(a.due_at)+' · '+a.points_possible+' pts')+
+    (!isFaculty()?button('Submit Answer','openRealSubmit',JSON.stringify(a.id)):'')+
+    (isFaculty()?current().submissions.filter(x=>x.assignment_id===a.id).map(x=>
+      card('Student submission · '+x.status,'Submitted '+fmt(x.submitted_at)+ ' · '+(x.score??'Not graded'))+
+      button('Grade Submission','openRealGrade',JSON.stringify(x.id))).join(''):'')));
 window.renderTabQuiz=c=>box('BUKLOD Quiz / Assessments',rows(current().assessments,x=>
   card(x.title,(x.status||'')+' · '+fmt(x.opens_at)+' · '+(x.points_possible??'—')+' points'))+
   empty('To take a timed assessment, use the official BUKLOD Quiz entry point. No simulated attempts or scores are created here.'));
@@ -305,21 +410,206 @@ window.renderTabNotices=c=>box('Formal Notices & Conduct',
         (seen?'<span class="pill-badge pill-cyan">Acknowledged '+esc(fmt(seen.acknowledged_at))+'</span>':
           button('I ACKNOWLEDGE','acknowledgeFormalNotice',JSON.stringify(n.id))):'');
   }));
+window.openPerformanceEntry=()=>{
+  if(!isFaculty())return show('Faculty gradebook permission required.');
+  const members=(current().roster||[]).filter(x=>x.roster_status==='ACTIVE');
+  const categories=current().gradeCategories||[];
+  if(!members.length)return show('No active official roster members are available.');
+  if(!categories.length)return show('Configure an official grade category before recording scores.');
+  window.openSlideDrawer('FACULTY GRADEBOOK','Record graded performance',
+    '<form id="performanceEntryForm">'+
+    '<label class="field">Official student<select name="roster_member_id" class="form-select" required>'+
+      members.map(m=>'<option value="'+esc(m.roster_member_id)+'">'+esc(m.official_name)+'</option>').join('')+'</select></label>'+
+    '<label class="field">Performance type<select name="type" class="form-select" required>'+
+      '<option value="PARTICIPATION">Participation</option><option value="RECITATION">Recitation</option>'+
+      '<option value="PRESENTATION">Presentation</option><option value="SKILL_DEMO">Skill demonstration</option>'+
+      '<option value="OTHER">Other</option></select></label>'+
+    '<label class="field">Grade category<select name="category" class="form-select" required>'+
+      categories.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+' · '+esc(c.term_key||'Term')+'</option>').join('')+'</select></label>'+
+    '<label class="field">Title<input name="title" class="form-input" maxlength="180" required></label>'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">'+
+    '<label class="field">Score<input name="score" class="form-input" type="number" min="0" step="0.01" required></label>'+
+    '<label class="field">Points possible<input name="points" class="form-input" type="number" min="0.01" step="0.01" value="100" required></label></div>'+
+    '<label class="field">Feedback<textarea name="feedback" class="form-textarea" maxlength="4000"></textarea></label>'+
+    '<label><input name="release" type="checkbox"> Release this item to the student</label>'+
+    '<p class="field-hint">The signed-in faculty account and roster membership are verified again by the gradebook RPC.</p>'+
+    '<button type="submit" class="btn-primary-cyan">Save official score</button></form>');
+  const form=el('performanceEntryForm');
+  form.onsubmit=async event=>{
+    event.preventDefault();
+    const submit=form.querySelector('button[type="submit"]');if(submit)submit.disabled=true;
+    try{
+      const f=new FormData(form),score=Number(f.get('score')),points=Number(f.get('points'));
+      const title=String(f.get('title')||'').trim();
+      if(!title||!Number.isFinite(score)||!Number.isFinite(points)||score<0||points<=0||score>points)
+        throw Error('Enter a title and a score between zero and the points possible.');
+      const id=await call(db.rpc('buklod_classroom_record_roster_performance_v1',{
+        p_classroom_id:app.activeClassId,p_roster_member_id:String(f.get('roster_member_id')),
+        p_performance_type:String(f.get('type')),p_title:title,p_score:score,p_points_possible:points,
+        p_feedback:String(f.get('feedback')||'').trim()||null,p_rubric:{},p_grade_category_id:String(f.get('category')),
+        p_release:f.get('release')==='on',p_live_session_id:null
+      }));
+      if(!isoId(id))throw Error('The server did not confirm the official score.');
+      await fetchCurrent(app.activeClassId,'grades');
+      window.closeSlideDrawer();window.renderSubjectWorkspace();
+      show('Official score saved in BUKLOD Gradebook.');
+    }catch(error){show('Score not saved: '+safeError(error));}
+    finally{if(submit?.isConnected)submit.disabled=false;}
+  };
+};
 window.renderTabGrades=c=>box(isFaculty()?'Official Faculty Gradebook':'My Released Grades',
-  isFaculty()?rows(current().grades,x=>card(x.official_name,
+  (isFaculty()?button('+ Add graded performance','openPerformanceEntry')+' '+button('Export gradebook CSV','exportGradebookCSV')+'<div style="height:12px"></div>':'')+
+  (isFaculty()?rows(current().grades,x=>card(x.official_name,
     'Status: '+(x.final_status||'Draft')+' · Transmuted: '+(x.transmuted_grade??'Not released')+
     ' · Remarks: '+(x.grade_remarks||'—'))):
   rows(current().grades,x=>card(x.title,'Score: '+(x.score??'—')+'/'+(x.points_possible??'—')+
-    ' · Status: '+(x.status||'—')+' · '+(x.feedback||''))));
-window.renderTabAttendance=c=>box('Verified Class Attendance',
-  rows(current().attendance,x=>card('Session '+fmt(x.opened_at),
-    'Closed: '+fmt(x.closed_at)+' · '+(x.term_key||'Term not specified')))+
-  (!isFaculty()?box('My Attendance',rows(current().studentAttendance,x=>card(x.status,fmt(x.time_in)))):''));
+    ' · Status: '+(x.status||'—')+' · '+(x.feedback||'')))));
+window.exportGradebookCSV=()=>{
+  if(!activeUser || !isFaculty() || app.activeSubtab!=='grades' || current().loadedTab!=='grades')
+    return show('Open your authorized Faculty Gradebook before exporting.');
+  const official=current().grades;
+  if(!Array.isArray(official) || !official.length)
+    return show('No official faculty gradebook rows are available to export.');
+  try{
+    const csv=buildFacultyGradebookCsv(official);
+    const fileName=facultyGradebookFilename(app.classrooms[app.activeClassId]?.className,app.activeClassId);
+    const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+    const anchor=document.createElement('a');
+    anchor.href=url;anchor.download=fileName;anchor.hidden=true;
+    document.body.appendChild(anchor);anchor.click();anchor.remove();
+    window.setTimeout(()=>URL.revokeObjectURL(url),1000);
+    show('CSV prepared from the authorized gradebook. Verify before official use; this does not release grades.');
+  }catch(error){show('Could not export gradebook: '+safeError(error));}
+};
+window.renderTabAttendance=c=>{
+  const sessions=current().attendance||[];
+  const active=sessions.find(s=>!s.closed_at);
+  const roster=current().roster||[];
+  const controls=isFaculty()?
+    (active?button('Close attendance session','closeAttendanceSession')+'<div style="height:10px"></div>':
+      button('Open attendance session','openAttendanceSession')+'<div style="height:10px"></div>')+
+    (active?box('Mark official roster',
+      rows(roster.filter(m=>m.roster_status==='ACTIVE'),m=>
+        '<div class="surface-card" style="padding:11px 12px;margin-bottom:9px"><strong>'+esc(m.official_name)+'</strong>'+
+        '<div style="font-size:12px;color:#64748b;margin:4px 0 8px">'+esc(m.attendance||'Not marked')+'</div>'+
+        '<div style="display:flex;gap:6px;flex-wrap:wrap">'+
+        ['PRESENT','LATE','ABSENT','EXCUSED'].map(status=>button(status,'setStudentAttendance',
+          JSON.stringify(m.roster_member_id)+','+JSON.stringify(status))).join('')+'</div></div>')):'')
+    :'';
+  return box('Verified Class Attendance',controls+
+    rows(sessions,x=>card('Session '+fmt(x.opened_at),
+      'Closed: '+fmt(x.closed_at)+' · '+(x.term_key||'Term not specified')))+
+    (!isFaculty()?box('My Attendance',rows(current().studentAttendance,x=>card(x.status,fmt(x.time_in)))):''));
+};
 window.renderTabMasterlist=c=>box('Official Class Roster',
   (isFaculty()?rows(current().roster,x=>card(x.official_name,(x.official_student_no||'Unassigned ID')+
   ' · '+x.roster_status+' · '+x.link_status)):empty('Student accounts cannot access the private faculty roster.'))+
   empty('Import and roster modifications require the official validated eight-step importer.'));
-window.renderTabRLE=c=>statusCard('Clinical & RLE Progress');
+window.openAttendanceSession=()=>{
+  if(!isFaculty())return show('Faculty attendance permission required.');
+  const open=(current().attendance||[]).find(s=>!s.closed_at);
+  if(open)return show('An attendance session is already open.');
+  void writeOnce(async()=>{
+    const context=current().context||{};
+    const result=await call(db.from('buklod_education_attendance_sessions').insert({
+      classroom_id:app.activeClassId,opened_by:activeUser.id,
+      term_key:context.term_key||context.term||app.classrooms[app.activeClassId]?.term||'CURRENT',
+      policy:{source:'FACULTY_ROSTER',official_roster_authority:true}
+    }).select('id').single());
+    if(!result?.id)throw Error('The server did not confirm the attendance session.');
+    return result;
+  });
+};
+window.closeAttendanceSession=()=>{
+  if(!isFaculty())return show('Faculty attendance permission required.');
+  const session=(current().attendance||[]).find(s=>!s.closed_at);
+  if(!session)return show('There is no open attendance session.');
+  if(!window.confirm('Close this attendance session and sync verified entries to the gradebook?'))return;
+  void writeOnce(async()=>{
+    const result=await call(db.rpc('buklod_education_close_attendance_session_v2',{p_session_id:session.id}));
+    if(result?.closed!==true)throw Error('The server did not confirm session closure.');
+    return result;
+  });
+};
+window.setStudentAttendance=(rosterMemberId,status)=>{
+  if(!isFaculty())return show('Faculty attendance permission required.');
+  const allowed=['PRESENT','LATE','ABSENT','EXCUSED'];
+  if(!allowed.includes(String(status).toUpperCase()))return show('Invalid attendance status.');
+  const member=(current().roster||[]).find(x=>x.roster_member_id===rosterMemberId);
+  const session=(current().attendance||[]).find(s=>!s.closed_at);
+  if(!member||!session)return show('Open an attendance session and select an official roster member first.');
+  void writeOnce(()=>call(db.rpc('buklod_classroom_record_roster_attendance_v1',{
+    p_session_id:session.id,p_roster_member_id:member.roster_member_id,p_status:String(status).toUpperCase()
+  })));
+};
+window.renderTabRLE=c=>{
+  const rotations=current().rotations||[],hours=current().rleHours||[];
+  const controls=isFaculty()?
+    button('+ Add RLE rotation','openRleRotationDrawer')+' '+button('Log verified hours for review','openRleHoursDrawer')+'<div style="height:10px"></div>':'';
+  const rotationCards=box('RLE / OJT Rotations',controls+rows(rotations,r=>
+    card(r.title,(r.area_name||'Clinical area')+' · '+(r.organization_name||'Placement site')+
+      ' · Required hours: '+r.required_hours+' · '+fmt(r.starts_at)))) ;
+  const hourCards=box(isFaculty()?'Faculty RLE hour entries':'My RLE hour entries',
+    rows(hours,h=>{
+      const rotation=rotations.find(r=>r.id===h.rotation_id);
+      const member=(current().roster||[]).find(m=>m.student_user_id===h.student_user_id);
+      return card(isFaculty()?(member?.official_name||'Roster account'):(rotation?.title||'RLE placement'),
+        h.duty_date+' · '+(Number(h.credited_minutes||0)/60).toFixed(2)+' hours · '+h.verification_status);
+    }));
+  return rotationCards+hourCards;
+};
+window.openRleRotationDrawer=()=>{
+  if(!isFaculty())return show('Faculty RLE permission required.');
+  window.openSlideDrawer('RLE / OJT SETUP','Add clinical rotation',
+    '<form id="rleRotationForm">'+
+    '<label class="field">Rotation title<input name="title" class="form-input" maxlength="160" required></label>'+
+    '<label class="field">Clinical area<input name="area" class="form-input" maxlength="120"></label>'+
+    '<label class="field">Placement site<input name="organization" class="form-input" maxlength="160"></label>'+
+    '<label class="field">Required hours<input name="hours" class="form-input" type="number" min="0" max="10000" step="0.25" value="0" required></label>'+
+    '<label class="field">Starts<input name="starts" class="form-input" type="date"></label>'+
+    '<label class="field">Ends<input name="ends" class="form-input" type="date"></label>'+
+    '<button type="submit" class="btn-primary-cyan">Save rotation</button></form>');
+  el('rleRotationForm').onsubmit=e=>{
+    e.preventDefault();const f=new FormData(e.target),title=String(f.get('title')||'').trim(),hours=Number(f.get('hours'));
+    if(!title||!Number.isFinite(hours)||hours<0||hours>10000)return show('Enter a valid rotation title and required hours.');
+    const starts=f.get('starts')?new Date(String(f.get('starts'))+'T00:00:00Z').toISOString():null;
+    const ends=f.get('ends')?new Date(String(f.get('ends'))+'T23:59:59Z').toISOString():null;
+    if(starts&&ends&&Date.parse(ends)<Date.parse(starts))return show('End date must be on or after start date.');
+    void writeOnce(()=>call(db.from('buklod_education_rle_rotations').insert({
+      classroom_id:app.activeClassId,title,area_name:String(f.get('area')||'').trim()||null,
+      organization_name:String(f.get('organization')||'').trim()||null,required_hours:hours,
+      starts_at:starts,ends_at:ends,created_by:activeUser.id
+    })));
+  };
+};
+window.openRleHoursDrawer=()=>{
+  if(!isFaculty())return show('Faculty RLE permission required.');
+  const rotations=current().rotations||[];
+  const members=(current().roster||[]).filter(m=>m.roster_status==='ACTIVE'&&isoId(m.student_user_id));
+  if(!rotations.length||!members.length)return show('Add a rotation and link the student to an official BUKLOD account first.');
+  window.openSlideDrawer('RLE / OJT HOURS','Log hours for supervisor review',
+    '<form id="rleHoursForm">'+
+    '<label class="field">Rotation<select name="rotation" class="form-select" required>'+rotations.map(r=>'<option value="'+esc(r.id)+'">'+esc(r.title)+'</option>').join('')+'</select></label>'+
+    '<label class="field">Official student<select name="student" class="form-select" required>'+members.map(m=>'<option value="'+esc(m.student_user_id)+'">'+esc(m.official_name)+'</option>').join('')+'</select></label>'+
+    '<label class="field">Duty date<input name="date" class="form-input" type="date" required></label>'+
+    '<label class="field">Time in<input name="time_in" class="form-input" type="datetime-local" required></label>'+
+    '<label class="field">Time out<input name="time_out" class="form-input" type="datetime-local" required></label>'+
+    '<p class="field-hint">Entries stay PENDING until verified. This form does not certify clinical hours.</p>'+
+    '<button type="submit" class="btn-primary-cyan">Save hours for review</button></form>');
+  el('rleHoursForm').onsubmit=e=>{
+    e.preventDefault();const f=new FormData(e.target);
+    const start=Date.parse(String(f.get('time_in')||'')),end=Date.parse(String(f.get('time_out')||''));
+    if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start)return show('Enter valid duty start and end times.');
+    const minutes=Math.round((end-start)/60000);
+    if(minutes>24*60)return show('A single duty entry cannot exceed 24 hours.');
+    void writeOnce(()=>call(db.from('buklod_education_rle_hours').insert({
+      classroom_id:app.activeClassId,rotation_id:String(f.get('rotation')),
+      student_user_id:String(f.get('student')),duty_date:String(f.get('date')),
+      time_in:new Date(start).toISOString(),time_out:new Date(end).toISOString(),
+      credited_minutes:minutes,verification_status:'PENDING',evidence:[]
+    })));
+  };
+};
 window.renderTabPortfolio=c=>statusCard('Student Portfolio / Journals');
 window.renderTabSettings=c=>box('Classroom Settings',card(c.className,
   'Status: '+c.status+' · Term: '+c.term+' · Classroom ID: '+c.id)+
@@ -327,26 +617,32 @@ window.renderTabSettings=c=>box('Classroom Settings',card(c.className,
 
 let writeBusy=false;
 async function writeOnce(task){
-  if(writeBusy)return;
+  if(writeBusy)return show('An official save is already in progress. Please avoid duplicate submissions.');
+  const initialUser=activeUser?.id,initialClass=app.activeClassId;
+  const initialMode=desiredMode,initialTab=app.activeSubtab;
+  if(!initialUser || !validClass(initialClass))return show('Sign in and open an authorized classroom before saving.');
+  const sameContext=()=>activeUser?.id===initialUser &&
+    app.activeClassId===initialClass && desiredMode===initialMode;
   writeBusy=true;
-  let result;
   try{
-    result=await task();
+    const result=await task();
     if(result?.ok===false)throw Error(result?.error||'Backend rejected the action.');
+    // Never refresh an unrelated classroom or newly switched role after a delayed write.
+    if(!sameContext())return;
+    const warning=result?.warning || (result?.gradebook_recorded===false?
+      'Score saved, but it was not added to the weighted gradebook.':'');
+    show(warning?'Saved with warning: '+warning:'Saved and confirmed by BUKLOD Supabase.');
+    try{
+      if(app.activeSubtab!==initialTab)return;
+      await fetchCurrent(initialClass,initialTab);
+      if(!sameContext() || app.activeSubtab!==initialTab)return;
+      window.closeSlideDrawer();
+      window.renderSubjectWorkspace();
+    }catch(err){
+      if(sameContext())show('Saved successfully, but refreshing failed: '+safeError(err));
+    }
   }catch(err){
-    show('Not saved: '+safeError(err));
-    writeBusy=false;
-    return;
-  }
-  const warning=result?.warning || (result?.gradebook_recorded===false?
-    'Score saved, but it was not added to the weighted gradebook.':'');
-  show(warning?'Saved with warning: '+warning:'Saved and confirmed by BUKLOD Supabase.');
-  try{
-    await fetchCurrent(app.activeClassId,app.activeSubtab);
-    window.closeSlideDrawer();
-    window.renderSubjectWorkspace();
-  }catch(err){
-    show('Saved successfully, but refreshing failed: '+safeError(err));
+    if(sameContext())show('Not saved: '+safeError(err));
   }finally{writeBusy=false;}
 }
 window.acknowledgeFormalNotice=noticeId=>{
@@ -444,11 +740,11 @@ window.openRealGrade=submissionId=>{
 // Never impersonate other accounts or show fake successful academic transactions.
 const unsupported=['confirmCreateClassroom','runEightStepRosterWizard','confirmRosterImportCommit',
   'archiveCurrentClass','attemptDeleteCurrentClass','updateStudentScore','updateStudentException',
-  'setStudentAttendance','markAllAttendancePresent','setLiveTeachingMode','callRandomLiveStudent',
+  'markAllAttendancePresent','setLiveTeachingMode','callRandomLiveStudent',
   'recordLiveRecitationScore','undoLastRecitationScore','autoGenerateSyllabusWeek','testIdempotentSubmission',
   'triggerQuickCheckPulse','syncQuizToGradebook','addMakeupDutyHours','toggleRleSkillCompetency',
   'saveJournalEntry','saveSpeedGraderScore','saveQuickAddItem','addAnnouncementComment',
-  'pushDirectlyToGitHub','openVercelDeployDrawer','openSpeedGraderDrawer','exportGradebookCSV',
+  'pushDirectlyToGitHub','openVercelDeployDrawer','openSpeedGraderDrawer',
   'advanceGradeLifecycle','changeGradingScheme','launchInteractiveQuizDrawer',
   'postClassChatMessage','sendCallAttentionAlert','submitInteractiveQuizAttempt','submitQuickAdd',
   'syncLiveAttendanceToClass','copyFullHtmlToClipboard','downloadFullHtmlFile'];
@@ -481,7 +777,7 @@ window.openAuditDrawer=()=>window.openSlideDrawer('LIVE SYSTEM STATUS','Authenti
 window.openQuickAddDrawer=type=>{if(type==='announcement'||!type)return window.openRealPost();show('Use the corresponding authorized class module to create this item.');};
 
 window.openClassSwitcherDrawer=()=>{
-  const items=Object.values(app.classrooms);
+  const items=visibleClasses();
   const html=items.length?items.map(c=>
     '<button type="button" class="surface-card" style="display:block;width:100%;text-align:left;margin-bottom:10px" '+
     'onclick="openSubjectClass(\''+c.id+'\',\'CLASS\',\'overview\')">'+
@@ -489,7 +785,42 @@ window.openClassSwitcherDrawer=()=>{
     esc(c.section)+' · '+esc(c.semester)+'</div></button>').join(''):empty('No linked classrooms');
   window.openSlideDrawer('CLASSROOM DIRECTORY','Switch assigned classroom',html);
 };
-window.openCreateClassroomDrawer=()=>show('Use the authorized BUKLOD Main faculty controls to create a classroom.');
+window.openCreateClassroomDrawer=async()=>{
+  try{
+    const gate=await call(db.rpc('buklod_classroom_launcher_access_v1'));
+    if(gate?.is_faculty!==true)throw Error('Faculty access required to create a classroom.');
+    window.openSlideDrawer('NEW CLASSROOM','Create an official BUKLOD class',
+      '<form id="classroomCreateForm">'+
+      '<label class="field">Class name<input name="name" class="form-input" maxlength="120" required></label>'+
+      '<label class="field">Subject code<input name="subject_code" class="form-input" maxlength="40"></label>'+
+      '<label class="field">Section<input name="section_name" class="form-input" maxlength="80"></label>'+
+      '<label class="field">School year<input name="school_year" class="form-input" maxlength="40" placeholder="e.g. 2026–2027"></label>'+
+      '<label class="field">Term<input name="term" class="form-input" maxlength="50"></label>'+
+      '<label class="field">Description<textarea name="description" class="form-textarea" maxlength="1000"></textarea></label>'+
+      '<p class="field-hint">Class access and creation are checked by BUKLOD Supabase policies. The creator is recorded as faculty.</p>'+
+      '<button type="submit" class="btn-primary-cyan">Create Classroom</button></form>');
+    const form=el('classroomCreateForm');
+    form.onsubmit=async event=>{
+      event.preventDefault();
+      const submit=form.querySelector('button[type="submit"]');
+      if(submit)submit.disabled=true;
+      try{
+        const f=new FormData(form);
+        const payload=buildClassroomRecord({
+          name:f.get('name'),subject_code:f.get('subject_code'),section_name:f.get('section_name'),
+          school_year:f.get('school_year'),term:f.get('term'),description:f.get('description')
+        },activeUser?.id);
+        const created=await call(db.from('buklod_education_classrooms')
+          .insert(payload).select('id,name').single());
+        show('Classroom created and confirmed by BUKLOD Supabase.');
+        window.closeSlideDrawer();
+        await refreshClasses();
+        if(validClass(created?.id))await window.openSubjectClass(created.id,'CLASS','overview');
+      }catch(error){show('Classroom not created: '+safeError(error));}
+      finally{if(submit?.isConnected)submit.disabled=false;}
+    };
+  }catch(error){show(safeError(error));}
+};
 window.openItemInspector=(type,id)=>type==='announcement'?window.openRealComment(id):show('Open the relevant official module for details.');
 window.runContextAction=action=>{window.closeContextMenu();show(action==='open'?'Open the official classroom module.':'This context action requires a verified backend write. Nothing was modified.');};
 function clearPrivateSession(){
@@ -509,7 +840,7 @@ window.handleSignOutClick=async()=>{
 };
 // Respond immediately to sign-out from another tab/device to avoid showing stale
 // cached academic data from a revoked local session.
-db.auth.onAuthStateChange(event=>{
+if(db)db.auth.onAuthStateChange(event=>{
   if(event==='SIGNED_OUT')clearPrivateSession();
 });
 
@@ -543,8 +874,13 @@ async function consumeMainDoorHandoff(){
 }
 function displayAuth(errorText=''){
   el('liveAuthScreen')?.remove();
-  const node=document.createElement('section');node.id='liveAuthScreen';node.innerHTML=
-    '<div class="auth-wrap"><div style="font-size:34px;margin-bottom:10px">▦</div><h1>BUKLOD Classroom</h1>' +
+  const node=document.createElement('section');node.id='liveAuthScreen';
+  if(!db){
+    node.innerHTML='<div class="auth-wrap" role="alert"><h1>BUKLOD Classroom</h1>'+
+      '<p>Secure Classroom service configuration is missing. Ask your administrator to configure the authorized Supabase URL and publishable key.</p></div>';
+    document.body.appendChild(node);return;
+  }
+  node.innerHTML='<div class="auth-wrap"><div style="font-size:34px;margin-bottom:10px">▦</div><h1>BUKLOD Classroom</h1>' +
     '<p>Sign in with your BUKLOD account to access your assigned classrooms and official academic records.</p>'+
     '<form id="liveLogin"><label>Email<input name="email" type="email" required autocomplete="username" placeholder="Your BUKLOD email"></label>'+
     '<label>Password<input name="password" type="password" required autocomplete="current-password" placeholder="Password"></label>'+
@@ -591,11 +927,14 @@ for(const selector of ['button[onclick="openVercelDeployDrawer()"]','button[oncl
 }
 window.addEventListener('offline',()=>{const x=el('networkLabel');if(x)x.textContent='Offline · Read only';});
 window.addEventListener('online',()=>{const x=el('networkLabel');if(x)x.textContent='Online · BUKLOD';});
-if(ssoHandoff)displayHandoffProgress();else displayAuth();
-try{
-  if(ssoHandoff)await consumeMainDoorHandoff();
-  await hydrate();
-}catch(err){
-  displayAuth(ssoHandoff ? safeError(err) :
-    'Could not load your assigned classrooms: '+safeError(err));
+if(!db)displayAuth();
+else{
+  if(ssoHandoff)displayHandoffProgress();else displayAuth();
+  try{
+    if(ssoHandoff)await consumeMainDoorHandoff();
+    await hydrate();
+  }catch(err){
+    displayAuth(ssoHandoff ? safeError(err) :
+      'Could not load your assigned classrooms: '+safeError(err));
+  }
 }

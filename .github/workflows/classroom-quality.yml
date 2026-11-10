@@ -1,0 +1,21 @@
+name: Classroom quality gates
+
+on:
+  push:
+    branches: [codex/school-ready-class-creation-20261110]
+  pull_request:
+    branches: [dev/classroom-source-recovery-20261110]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run build

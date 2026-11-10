@@ -73,7 +73,9 @@ test('Unverified academic mutations are visibly blocked and not marked saved',()
 });
 test('Browser client never carries a privileged Supabase key',()=>{
   assert.doesNotMatch(js,/sb_secret_|service_role/);
-  assert.match(js,/sb_publishable_/);
+  assert.match(js,/VITE_SUPABASE_PUBLISHABLE_KEY/);
+  assert.doesNotMatch(js,/sb_publishable_[A-Za-z0-9_-]{20,}/);
+  assert.doesNotMatch(js,/https:\/\/[a-z0-9]+\.supabase\.co/);
   assert.match(js,/incoming\.delete\(name\)/);
 });
 
